@@ -26,25 +26,35 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("study-bot")
 
-TOKEN = os.environ["TELEGRAM_TOKEN"]
-MODEL = os.getenv("MODEL", "gemini-flash-lite-latest")
+# ------------------------------------------------------------------ config
+TOKEN = os.environ["TELEGRAM_TOKEN"].strip()
+MODEL = os.getenv("MODEL", "gemini-flash-latest").strip()
+FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "gemini-flash-lite-latest").strip()
 NUM_Q = int(os.getenv("NUM_QUESTIONS", "8"))
 MAX_PAGES = int(os.getenv("MAX_PAGES", "30"))
+BATCH = max(1, int(os.getenv("BATCH_PAGES", "3")))
+MAX_IMAGES = int(os.getenv("MAX_IMAGES", "20"))
+DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "60"))  # requests per user per day, 0 = unlimited
 PORT = int(os.getenv("PORT", "10000"))
 ALLOWED = {int(x) for x in os.getenv("ALLOWED_IDS", "").split(",") if x.strip()}
 
-client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"].strip())
 sessions: dict[int, dict] = {}
 history: dict[int, list] = {}
 venting: set[int] = set()
 vent_hist: dict[int, list] = {}
 busy: set[int] = set()
+locks: dict[int, asyncio.Lock] = {}
+usage: dict[int, list] = {}
+bg_tasks: set = set()
 
 LETTERS = {"en": ["A", "B", "C", "D"], "ar": ["أ", "ب", "ج", "د"]}
+IMG_MIMES = {"image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"}
 
 LIMIT_MSG = "وصلنا للحد المجاني لجيمناي، جرّب بعد شوي ⏳\nFree limit reached, please try again in a bit."
 ERR_MSG = "صار خطأ، جرّب مرة ثانية.\nSomething went wrong, please try again."
 NODOC_MSG = "ابعت الملف أو الصور أولاً 📄"
+QUOTA_MSG = "وصلت للحد اليومي من الطلبات 🙏 جرّب بكرة بإذن الله.\nDaily limit reached, please try again tomorrow."
 
 CREDIT = (
     "👨‍💻 تم تطوير البوت بواسطة @mbxll0\n"
@@ -55,17 +65,22 @@ CREDIT = (
 
 HELP_TEXT = (
     "ℹ️ شو بقدر أعمل؟\n\n"
-    "1) ابعت ملف PDF أو صور أو نص، وبعدين اطلب اللي بدك:\n"
+    "1) ابعت ملف PDF أو صور (صورة أو عدة صور) أو نص.\n"
+    "2) اضغط 🧠 «تحليل ذكي»: بقرأ كل صفحة، إذا فيها أسئلة بحلها بالتفصيل، وإذا فيها شرح "
+    "بشرحه شرح وافي (عربي ← عربي، إنجليزي ← إنجليزي + عربي).\n"
+    "3) أو اكتب طلبك مباشرة:\n"
     "• اشرح صفحة 5\n"
+    "• حل السؤال 3 صفحة 4\n"
     "• اعمل 10 أسئلة من صفحة 3 الى 6\n"
     "• لخص صفحة 2\n"
-    "• حل السؤال 3 صفحة 4\n"
+    "• مصطلحات صفحة 7\n"
+    "• توقعات امتحان صفحة 1-4\n"
     "• بطاقات مراجعة لصفحة 7\n"
     "• أو اسألني أي سؤال عن المادة\n\n"
-    "2) تقدر تستخدم الأزرار بدل الكتابة.\n"
-    "3) رقم الصفحة = ترتيبها داخل الملف، مش رقمها المطبوع.\n"
-    "4) صور متتالية خلال دقيقة بتنضم لنفس الملف.\n"
-    "5) /new ملف جديد  /vent فضفضة  /about عن البوت"
+    "4) نصيحة: ابعت الصور «كملف» (بدون ضغط) عشان تطلع أوضح، وصوّر الصفحة كاملة وبإضاءة كويسة.\n"
+    "5) رقم الصفحة = ترتيبها داخل الملف، مش رقمها المطبوع.\n"
+    "6) صور متتالية خلال دقيقة بتنضم لنفس الملف.\n"
+    "7) /new ملف جديد  /vent فضفضة  /about عن البوت"
 )
 
 CHEER_ANY = [
@@ -156,29 +171,77 @@ T = {
     },
 }
 
-EXPLAIN_SYS = """You are an expert university tutor with a friendly, motivating style. The student sends part of a lecture, textbook, slides, or problem sheet and wants it explained.
+# ------------------------------------------------------------------ prompts
+FORMAT_RULES = """
 
-DETECT the content language and kind:
-- If the content is mainly Arabic: explain in Arabic only (put the English technical term in parentheses on first mention).
-- Otherwise: explain each section in clear English first, then the same idea in simple Arabic (Jordanian-friendly Modern Arabic), keeping technical terms in English.
-- If the student's request clearly asks for a specific language, follow it.
-- Kind "theory": cover EVERYTHING in the given content: every concept, definition, formula, term, example, table, and figure. Do not skip details. Organize into short numbered sections, add a short real-world example or intuition where it helps, explain formulas step by step and say what each symbol means.
-- Kind "problems": start with a short "Method and formulas" section, then solve EVERY problem step by step with all calculations and units, double-check the arithmetic, and end each with "Answer: ..." (or "الجواب: ...").
-- Follow the details of the student's request (more detail, simpler, focus on a topic, and so on) exactly.
-- End with a short list "Key Takeaways" (or "أهم النقاط" when the explanation is Arabic).
-- If something is unreadable, say so instead of guessing.
-Plain text only: no markdown symbols (no *, #, backticks) and NEVER LaTeX or dollar signs. Write math in Unicode: x², √, π, ×, ÷, ≤, ≥, ∫, Σ, x₁. Use numbering, line breaks and a few emojis for headings."""
+FORMAT RULES (strict):
+- Plain text only: no markdown symbols (no *, #, backticks, no tables with |) and NEVER LaTeX or dollar signs.
+- Write math in Unicode: x², x₁, √, π, ×, ÷, ≤, ≥, ≠, ≈, ∞, ∫, ∑, Δ, α, β, θ, λ, ħ, ψ, →, ⇒. Write fractions as (a)/(b).
+- Put every section heading on its own line starting with "§ " followed by an emoji and the title, for example "§ 📌 المفاهيم الأساسية". The app turns these lines into bold headings.
+- Use numbering, short lines and blank lines between sections so it is easy to read on a phone.
+- Every final answer of a problem goes on its own line that starts with "Answer:" (or "الجواب:" when writing Arabic)."""
 
-REQUEST_SYS = """You are an expert, careful tutor. The student sends content (image, PDF, or text) together with a request. Do exactly what the request asks: solve, explain, translate, check answers, and so on.
+LANG_RULES = """
+
+LANGUAGE RULES (decide separately for each page / question):
+- If the page is mainly Arabic: write the explanation in clear Arabic only, and put the English technical term in parentheses on first mention.
+- If the page is mainly English (or another Latin-script language): for every section write the explanation in English first, then the same explanation in simple, friendly Arabic right after it. Keep technical terms in English inside the Arabic text.
+- If the student's request clearly asks for a specific language, follow the request."""
+
+VISION_RULES = """
+
+READING THE INPUT: look very carefully at every image / page. Read all text, numbers, units, symbols, subscripts, axes, labels, circuit and free-body diagrams, tables, and handwriting. If any part is blurry, cut off or ambiguous, say exactly what you could not read and state your assumption; never invent content."""
+
+EXPLAIN_SYS = (
+    """You are an exceptional university professor and private tutor. The student sends pages from a lecture, textbook, slides or notes and needs a COMPLETE, deep explanation so that they can study ONLY from your answer and pass the exam.
+
+Rules:
+- Cover EVERYTHING on the pages: every concept, definition, law, theorem, formula, derivation step, table, chart, figure or diagram (describe what it shows and why it matters), example, footnote and highlighted term. Never skip or merge details to save space. No long introduction.
+- Go section by section in the order of the page. For each section: (1) the idea in simple words, (2) the precise details and definitions, (3) the intuition or why it matters, with a short real-life example or analogy when it helps.
+- Formulas: write the formula, say what each symbol means with its unit, explain where it comes from or when to use it, and give a tiny numeric example when useful.
+- Science and engineering (physics, quantum, nanotechnology, materials, chemistry, math): explain the physical meaning, the assumptions and limits, and how the concepts connect to each other.
+- Humanities, history and religion content: give the context (who, when, where, why), causes and effects, how events relate, and the significance. Only state names and dates that appear in the content or that you are certain of, and say so if you are not sure.
+- If a page mainly contains exercises or problems, solve them completely instead: restate the question, Given, Required, method, numbered steps with units, and a final "Answer:" line.
+- Where something is hard add a short "💡 تبسيط" note. Where students often make mistakes add a "⚠️ خطأ شائع" note.
+- End each page with "§ ✅ أهم النقاط" (a short list). At the very end of your whole answer add "§ 📝 اختبر نفسك" with 3 quick self-check questions and brief answers.
+- Follow the details of the student's request (more detail, simpler, focus on a topic, and so on) exactly."""
+    + LANG_RULES
+    + VISION_RULES
+    + FORMAT_RULES
+)
+
+REQUEST_SYS = (
+    """You are an expert, careful tutor. The student sends content (image, PDF, or text) together with a request. Do exactly what the request asks: solve, explain, translate, check answers, and so on.
 
 When the task is to solve:
 - If the request names specific questions (for example "solve question 3"), solve ONLY those. Otherwise solve every question and problem in the content, in order.
-- For each one: restate it in one short line, then show numbered step-by-step working with all calculations and units, double-check the arithmetic, and end with a clear line "Answer: ..." (or "الجواب: ..." in Arabic).
-- For multiple-choice questions: state the correct option and explain why. For written or theory questions: give a complete model answer.
-- If part of the content is unreadable or ambiguous, say clearly what you could not read and state your assumption instead of guessing silently.
+- For each one: restate it in one short line; for calculations write Given, Required, Method and formulas, then numbered step-by-step working with all calculations and units; double-check the arithmetic; end with a clear "Answer:" line.
+- Multiple-choice and true/false: state the correct option, explain why it is right and briefly why each other option is wrong.
+- Written or theory questions: give a complete model answer that would earn full marks.
+- If a question depends on a figure, read the figure carefully and say what you read from it.
+- Language: Arabic question gets an Arabic solution. English question gets the full solution in English followed by a clear Arabic explanation of the steps and the final answer. If the student's request is written in Arabic, make the explanations Arabic and keep technical terms in English."""
+    + VISION_RULES
+    + FORMAT_RULES
+)
 
-Language: if the student's request is written in Arabic, answer in Arabic (keep technical terms in English). Otherwise follow the content: Arabic content gets an Arabic answer; English content gets an English answer followed by a brief Arabic summary of the final answers.
-Plain text only: no markdown symbols (no *, #, or backticks) and NEVER LaTeX or dollar signs. Write math in Unicode: x², √, π, ×, ÷, ≤, ≥, ∫, Σ, x₁. Use numbering, line breaks and a few emojis for headings."""
+SMART_SYS = (
+    """You are an expert university tutor with a sharp eye. The student sends pages or photos (lecture slides, textbook pages, handwritten notes, exam sheets, problem sets). Look at EACH page, decide what it is, then act:
+
+A) The page contains QUESTIONS or PROBLEMS (exercises, exam questions, multiple choice, true/false, fill-in-the-blank, calculations, proofs, written questions) -> solve EVERY one completely:
+   - restate the question in one short line;
+   - calculations: Given, Required, Method and formulas, numbered steps with all calculations and units, double-check the arithmetic, then an "Answer:" line;
+   - multiple choice and true/false: say the correct option clearly, explain why it is right and briefly why each other option is wrong;
+   - theory or essay questions: a complete model answer that would earn full marks;
+   - if a question depends on a figure, read it carefully and say what you read.
+B) The page is EXPLANATORY (theory, slides, definitions, notes) -> explain it in full depth: every concept, definition, law, formula (with the meaning of each symbol and its unit), figure, table and example, section by section, with intuition and a short example where helpful. End the page with "§ ✅ أهم النقاط".
+C) The page mixes both -> explain the theory first, then solve the questions.
+D) Poor quality or handwriting -> read as best you can and say clearly which part is unclear and what you assumed.
+
+For several pages, handle each page separately under its own heading. Never skip details. Be accurate: double-check every number and fact. Where something is hard add a "💡 تبسيط" note, and where students often err add a "⚠️ خطأ شائع" note.
+Language: Arabic pages get Arabic only. English pages get the full English explanation or solution followed by a clear Arabic version (Arabic explanation of the steps, reasoning and final answer)."""
+    + VISION_RULES
+    + FORMAT_RULES
+)
 
 QUESTIONS_SYS = """You write practice questions from the given content. Return ONLY valid JSON, no code fences:
 {"language": "en", "questions": [{"q": "...", "options": ["...", "...", "...", "..."], "answer": 0, "why": "...", "hint": "..."}]}
@@ -190,7 +253,30 @@ QUESTIONS_SYS = """You write practice questions from the given content. Return O
 - Follow the details of the student's request (difficulty, topic) if given.
 - Plain text only, Unicode math (x², √, π, ×, ÷), NEVER LaTeX. Use \\n for line breaks inside JSON strings."""
 
-SUMMARY_SYS = """Write a compact cheat sheet of the given content: key ideas, definitions, formulas, solving patterns for math, and common mistakes. Language: Arabic content gets Arabic only; English content gets English followed by a short Arabic version. Follow the details of the student's request if given. Plain text only: no markdown symbols (no *, #, backticks), NEVER LaTeX; use Unicode math. Use numbering, line breaks and a few emojis."""
+SUMMARY_SYS = (
+    """Write a complete but compact study cheat sheet of the given content: key ideas, definitions, laws, formulas (with symbol meanings), solving patterns for math and physics, important dates and names for history, and common mistakes. Follow the details of the student's request if given."""
+    + LANG_RULES
+    + FORMAT_RULES
+)
+
+TERMS_SYS = (
+    """Extract EVERY important term from the given content and build a glossary. For each term write one block:
+- the term in English and in Arabic (Arabic content: the Arabic term with its English equivalent in parentheses),
+- a clear one or two line definition in simple words,
+- when useful, a formula, unit, or tiny example.
+Order the terms as they appear in the content. Follow the details of the student's request if given. Write the definitions in Arabic (keep English terms as they are)."""
+    + FORMAT_RULES
+)
+
+EXAM_SYS = (
+    """You are a university examiner. From the given content, write the questions most likely to appear in the exam, and answer each one fully with a model answer that would earn full marks.
+- Write 10 to 15 questions: definitions, short answers, explain / compare / why questions, numeric problems with complete solutions, and one or two essay questions.
+- Order them from most to least likely, mark each with its type, and add a suggested mark.
+- After each model answer add "⚠️ خطأ شائع" or "💡 نصيحة للامتحان" when relevant.
+- Follow the details of the student's request (difficulty, topic) if given."""
+    + LANG_RULES
+    + FORMAT_RULES
+)
 
 CARDS_SYS = """Create 10 flashcards from the given content for active recall. Return ONLY valid JSON, no code fences:
 {"cards": [{"front": "...", "back": "..."}]}
@@ -212,6 +298,13 @@ VENT_SYS = """You are a warm, caring friend for a university student who needs t
 - If the student mentions wanting to hurt themselves, not wanting to live, or being in danger, take it seriously: respond with warmth, tell them they matter, encourage them to talk to someone they trust right now (family, a friend) and to contact local emergency services or a mental health professional if they are in danger. Stay with them, do not change the subject, and never give harmful details.
 - Plain text only, no markdown symbols, no lists. A few gentle emojis are fine."""
 
+# action -> (system prompt, default request); these run page-batch by page-batch
+BATCHED = {
+    "smart": (SMART_SYS, "Look at every page. Solve all the questions and explain all the theory, in full detail."),
+    "explain": (EXPLAIN_SYS, "Explain this content comprehensively."),
+    "solve": (REQUEST_SYS, "Solve every question and problem in the content."),
+}
+
 
 # ---------------------------------------------------------------- basics
 
@@ -222,6 +315,20 @@ def allowed(uid: int) -> bool:
 _ids = [int(x) for x in os.getenv("ALLOWED_IDS", "").split(",") if x.strip()]
 ADMIN_ID = int(os.getenv("ADMIN_ID") or (_ids[0] if _ids else 0))
 seen: dict[int, dict] = {}
+
+
+def quota_ok(uid: int) -> bool:
+    if DAILY_LIMIT <= 0 or uid == ADMIN_ID:
+        return True
+    today = time.strftime("%Y-%m-%d")
+    rec = usage.get(uid)
+    if not rec or rec[0] != today:
+        rec = [today, 0]
+        usage[uid] = rec
+    if rec[1] >= DAILY_LIMIT:
+        return False
+    rec[1] += 1
+    return True
 
 
 def who(u) -> str:
@@ -245,6 +352,17 @@ async def track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await ctx.bot.send_message(ADMIN_ID, f"🆕 New user\n{who(u)}\n{status}")
         except Exception:
             log.exception("admin notify failed")
+
+
+async def deny(update: Update):
+    u = update.effective_user
+    try:
+        await update.effective_message.reply_text(
+            f"🔒 هالبوت خاص ومش مفعّل لحسابك.\nرقمك: {u.id}\nابعت الرقم لصاحب البوت عشان يفعّلك.\n\n"
+            f"This bot is private. Send your ID ({u.id}) to the owner to get access."
+        )
+    except Exception:
+        pass
 
 
 async def users_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -292,32 +410,65 @@ def one_line(x) -> str:
     return " ".join(str(x).split())
 
 
+_ANS_RE = re.compile(r"^(\W*)((?:Final answer|Answer|الجواب(?: النهائي)?)\s*[:：].*)$", re.I)
+
+
+def fmt_html(text: str) -> str:
+    """Turn '§ heading' lines and 'Answer:' lines into bold Telegram HTML."""
+    out = []
+    for line in text.split("\n"):
+        s = line.strip()
+        if s.startswith("§"):
+            out.append(f"<b>{html.escape(s.lstrip('§ ').strip(), quote=False)}</b>")
+            continue
+        esc = html.escape(line, quote=False)
+        esc = _ANS_RE.sub(r"\1<b>\2</b>", esc)
+        out.append(esc)
+    return "\n".join(out)
+
+
 async def send_long(ctx, chat: int, text: str):
-    for part in chunks((text or "").strip() or "..."):
-        await ctx.bot.send_message(chat, part)
+    for part in chunks((text or "").strip() or "...", 3500):
+        try:
+            await ctx.bot.send_message(chat, fmt_html(part), parse_mode="HTML")
+        except Exception:
+            await ctx.bot.send_message(chat, part.replace("§ ", ""))
 
 
-async def call_model(parts, instruction, system, as_json=True, max_tokens=16000) -> str:
+async def call_model(parts, instruction, system, as_json=True, max_tokens=16000, temperature=0.4) -> str:
     contents = list(parts) + [types.Part.from_text(text=instruction)]
     cfg = types.GenerateContentConfig(
         system_instruction=system,
         response_mime_type="application/json" if as_json else "text/plain",
         max_output_tokens=max_tokens,
+        temperature=temperature,
     )
+    models = [MODEL] + ([FALLBACK_MODEL] if FALLBACK_MODEL and FALLBACK_MODEL != MODEL else [])
     last = None
-    for attempt in range(3):
-        try:
-            resp = await client.aio.models.generate_content(
-                model=MODEL, contents=contents, config=cfg
-            )
-            return resp.text or ""
-        except Exception as e:
-            last = e
-            msg = str(e)
-            if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-                raise
-            await asyncio.sleep(2 * (attempt + 1))
-    raise last
+    for rnd in range(2):
+        limited = False
+        for mdl in models:
+            for attempt in range(2):
+                try:
+                    resp = await client.aio.models.generate_content(
+                        model=mdl, contents=contents, config=cfg
+                    )
+                    if resp.text:
+                        return resp.text
+                    last = RuntimeError("empty response")
+                    break
+                except Exception as e:
+                    last = e
+                    msg = str(e)
+                    if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                        limited = True
+                        break  # try the next model
+                    await asyncio.sleep(2 * (attempt + 1))
+        if not limited:
+            break
+        if rnd == 0:
+            await asyncio.sleep(20)
+    raise last or RuntimeError("no response")
 
 
 def fail_text(e: Exception) -> str:
@@ -343,6 +494,9 @@ INTENTS = {
     "cards": ["بطاقات", "فلاش", "flashcards", "flashcard", "cards"],
     "sum": ["لخص", "لخصلي", "ملخص", "تلخيص", "summary", "summarize"],
     "explain": ["اشرح", "اشرحلي", "شرح", "وضح", "فسر", "explain"],
+    "smart": ["حلل", "حللي", "حللها", "تحليل", "ذكي", "analyze", "analyse", "smart"],
+    "terms": ["مصطلحات", "مفردات", "glossary", "terms", "vocabulary"],
+    "exam": ["امتحان", "امتحانات", "توقعات", "exam", "exams"],
 }
 WORD2INTENT = {w: k for k, ws in INTENTS.items() for w in ws}
 
@@ -443,6 +597,36 @@ def slice_pdf(data: bytes, pages: list[int]) -> bytes:
     return out.getvalue()
 
 
+def check_pages(doc: dict, pages):
+    """Raise DocError with a user-facing message when the page request is not possible."""
+    if doc["kind"] == "text":
+        return
+    n = doc["n"]
+    if doc["kind"] == "pdf" and not n:
+        return
+    if pages:
+        bad = [p for p in pages if p > n]
+        if bad:
+            raise DocError(f"الملف فيه {n} صفحة بس، وما في صفحة {bad[0]} 🤔")
+        if len(pages) > MAX_PAGES:
+            raise DocError(f"حدد {MAX_PAGES} صفحة على الأكثر بالمرة 🙏")
+    elif n > MAX_PAGES:
+        raise DocError("toobig")
+
+
+def make_batches(doc: dict, pages):
+    """Split a page selection into small batches so every page gets a full-depth answer."""
+    if doc["kind"] == "text":
+        return [None]
+    n = doc["n"]
+    if not n:
+        return [pages]
+    sel = pages or list(range(1, n + 1))
+    if len(sel) <= BATCH:
+        return [sel]
+    return [sel[i : i + BATCH] for i in range(0, len(sel), BATCH)]
+
+
 async def build_parts(doc: dict, pages):
     """Return (parts, label). Raises DocError with a user-facing message."""
     kind = doc["kind"]
@@ -457,22 +641,16 @@ async def build_parts(doc: dict, pages):
         )
         return [types.Part.from_bytes(data=doc["pdf"], mime_type="application/pdf")], label
 
+    check_pages(doc, pages)
     if pages:
-        bad = [p for p in pages if p > n]
-        if bad:
-            raise DocError(f"الملف فيه {n} صفحة بس، وما في صفحة {bad[0]} 🤔")
-        if len(pages) > MAX_PAGES:
-            raise DocError(f"حدد {MAX_PAGES} صفحة على الأكثر بالمرة 🙏")
         label = f"page {pages[0]}" if len(pages) == 1 else f"pages {fmt_pages(pages)}"
     else:
-        if n > MAX_PAGES:
-            raise DocError("toobig")
         label = "all pages"
 
     if kind == "images":
         imgs = doc["images"]
         chosen = imgs if not pages else [imgs[p - 1] for p in pages]
-        return [types.Part.from_bytes(data=b, mime_type="image/jpeg") for b in chosen], label
+        return [types.Part.from_bytes(data=i["data"], mime_type=i["mime"]) for i in chosen], label
 
     # pdf
     if not pages:
@@ -497,16 +675,17 @@ def doc_intro(doc: dict) -> str:
         pg = f"📚 {doc['n']} صفحة\n" if doc["n"] else ""
         head = f"📥 استلمت الملف: {doc['name']}\n{pg}"
     elif doc["kind"] == "images":
-        head = (
-            "📥 استلمت الصورة (صفحة 1)\n"
-            "(ابعت صور ثانية خلال دقيقة وبنضمها لنفس الملف)\n"
-        )
+        n = doc["n"]
+        head = f"📥 استلمت {n} صفحة/صور\n"
+        if n == 1:
+            head += "(ابعت صور ثانية خلال دقيقة وبنضمها لنفس الملف)\n"
     else:
         head = "📥 استلمت النص\n"
     tail = "\nشو بدك أعمل فيه؟ اختار من الأزرار 👇"
     if doc["kind"] != "text":
         tail += (
-            "\nأو اكتب طلبك مباشرة، مثلاً:\n"
+            "\n🧠 «تحليل ذكي»: بقرا كل صفحة، إذا فيها أسئلة بحلها وإذا فيها شرح بشرحه بالتفصيل."
+            "\n\nأو اكتب طلبك مباشرة، مثلاً:\n"
             "• اشرح صفحة 5\n"
             "• اعمل 10 أسئلة من صفحة 3 الى 6\n"
             "• لخص صفحة 2\n"
@@ -523,9 +702,11 @@ def menu_kb(s=None, after_quiz: bool = False) -> InlineKeyboardMarkup:
         return InlineKeyboardButton(label, callback_data=f"m:{data}")
 
     rows = [
+        [b("🧠 تحليل ذكي (حل + شرح تلقائي)", "smart")],
         [b("📖 اشرح", "explain"), b("✅ حل الأسئلة", "solve")],
         [b("📝 أسئلة اختبار", "quiz"), b("📋 ملخص", "sum")],
-        [b("🃏 بطاقات", "cards"), b("❓ اسأل", "ask")],
+        [b("🃏 بطاقات", "cards"), b("🔤 مصطلحات", "terms")],
+        [b("🎯 توقعات امتحان", "exam"), b("❓ اسأل", "ask")],
     ]
     if after_quiz:
         rows.insert(0, [b("➕ أسئلة جديدة أصعب", "more")])
@@ -543,14 +724,20 @@ async def send_menu(ctx, chat: int, s=None, after_quiz: bool = False, text: str 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update.effective_user.id):
+        await deny(update)
         return
     await update.message.reply_text(
         "أهلاً! 👋 أنا مساعدك الدراسي 📚\n\n"
-        "📄 ابعتلي ملف PDF أو صور أو نص، وبعدين اطلب اللي بدك:\n"
+        "📄 ابعتلي ملف PDF أو صور أو نص، وبعدين:\n"
+        "🧠 اضغط «تحليل ذكي»: بقرا كل صفحة، إذا فيها أسئلة بحلها بالتفصيل، وإذا شرح بشرحه شرح وافي "
+        "(عربي ← عربي، إنجليزي ← إنجليزي + عربي)\n\n"
+        "أو اكتب طلبك:\n"
         "• اشرح صفحة 5\n"
         "• اعمل 10 أسئلة من صفحة 3 الى 6\n"
         "• لخص صفحة 2\n"
-        "• حل السؤال 3 صفحة 4\n\n"
+        "• حل السؤال 3 صفحة 4\n"
+        "• مصطلحات صفحة 7\n"
+        "• توقعات امتحان صفحة 1-4\n\n"
         "💬 أو اسألني أي سؤال، أو اضغط فضفضة إذا بدك تفضفض.\n\n"
         "/new ملف جديد   /help مساعدة   /about عن البوت\n\n"
         + CREDIT,
@@ -637,7 +824,7 @@ async def vent_reply(m, ctx: ContextTypes.DEFAULT_TYPE):
                 + "\n".join(f"Student: {q}\nYou: {a[:600]}" for q, a in hist[-6:])
                 + "\n\n"
             )
-        text = await call_model([], f"{convo}Student says: {m.text}", VENT_SYS, False, 4000)
+        text = await call_model([], f"{convo}Student says: {m.text}", VENT_SYS, False, 4000, 0.8)
         text = text.strip() or "🤍 أنا هون، كمّل احكي."
         hist.append((m.text, text))
         vent_hist[uid] = hist[-8:]
@@ -658,6 +845,9 @@ async def vent_reply(m, ctx: ContextTypes.DEFAULT_TYPE):
 async def answer_question(ctx, chat: int, uid: int, text: str, pages):
     if uid in busy:
         await ctx.bot.send_message(chat, "⏳ ...")
+        return
+    if not quota_ok(uid):
+        await ctx.bot.send_message(chat, QUOTA_MSG)
         return
     busy.add(uid)
     try:
@@ -684,7 +874,7 @@ async def answer_question(ctx, chat: int, uid: int, text: str, pages):
             )
         ctxnote = f"[File context: {label}]\n" if parts else ""
         answer = await call_model(
-            parts, f"{ctxnote}{convo}Student question: {text}", ASK_SYS, False, 8000
+            parts, f"{ctxnote}{convo}Student question: {text}", ASK_SYS, False, 8000, 0.4
         )
         answer = answer.strip() or "..."
         hist.append((text, answer))
@@ -708,6 +898,8 @@ async def handle_text(ctx, chat: int, uid: int, text: str):
             return
         await answer_question(ctx, chat, uid, text, None)
         return
+
+    doc["seen"] = time.time()
 
     # The user is answering "which pages?"
     if s.get("pending"):
@@ -735,12 +927,19 @@ async def run_action(ctx, chat: int, uid: int, action: str, pages=None, nq=None,
     if uid in busy:
         await ctx.bot.send_message(chat, "⏳ استنى لحظة، لسا بشتغل على طلبك السابق")
         return
+    if not quota_ok(uid):
+        await ctx.bot.send_message(chat, QUOTA_MSG)
+        return
     doc = s["doc"]
+    doc["seen"] = time.time()
     busy.add(uid)
     wait = None
     try:
+        parts, label = None, ""
         try:
-            parts, label = await build_parts(doc, pages)
+            check_pages(doc, pages)
+            if action not in BATCHED:
+                parts, label = await build_parts(doc, pages)
         except DocError as e:
             if str(e) == "toobig":
                 s["pending"] = {"action": action, "nq": nq, "extra": extra, "harder": harder}
@@ -754,62 +953,101 @@ async def run_action(ctx, chat: int, uid: int, action: str, pages=None, nq=None,
 
         await ctx.bot.send_chat_action(chat, "typing")
         wait = await ctx.bot.send_message(chat, "⏳ عم أشتغل على طلبك...")
-        note = f"[Content: {label}]"
         req = extra.strip()
 
-        if action == "explain":
-            instr = f"{note}\nStudent request: {req or 'Explain this content comprehensively.'}"
-            text = await call_model(parts, instr, EXPLAIN_SYS, False, 16000)
-            await send_long(ctx, chat, text)
+        if action in BATCHED:
+            system, default_req = BATCHED[action]
+            batches = make_batches(doc, pages)
+            total = len(batches)
+            finished = True
+            for i, b in enumerate(batches, 1):
+                if total > 1:
+                    try:
+                        await wait.edit_text(f"⏳ عم أشتغل على طلبك... ({i}/{total})")
+                    except Exception:
+                        pass
+                try:
+                    bparts, blabel = await build_parts(doc, b)
+                    note = f"[Content: {blabel}]"
+                    if b and doc["kind"] != "text":
+                        plist = ", ".join(str(p) for p in b)
+                        note += (
+                            f"\n[This batch contains ONLY these original page numbers, in this order: {plist}. "
+                            "Refer to them by these original numbers. Begin each page with a heading line "
+                            "'§ 📄 صفحة N | Page N' using these numbers.]"
+                        )
+                    instr = f"{note}\nStudent request: {req or default_req}"
+                    text = await call_model(bparts, instr, system, False, 32000, 0.3)
+                    await send_long(ctx, chat, text)
+                except Exception as e:
+                    log.exception("batch failed")
+                    msg = fail_text(e)
+                    if total > 1:
+                        msg += f"\n(تم إنجاز {i - 1} من {total} أجزاء، كمّل بعدين من الصفحات الباقية)"
+                    await ctx.bot.send_message(chat, msg)
+                    finished = False
+                    break
+                if i < total:
+                    await asyncio.sleep(3)
+            if finished and action in ("solve", "smart"):
+                await ctx.bot.send_message(chat, cheer())
             await send_menu(ctx, chat, s)
 
-        elif action == "solve":
-            instr = f"{note}\nStudent request: {req or 'Solve every question and problem in the content.'}"
-            text = await call_model(parts, instr, REQUEST_SYS, False, 16000)
-            await send_long(ctx, chat, text)
-            await ctx.bot.send_message(chat, cheer())
-            await send_menu(ctx, chat, s)
+        else:
+            note = f"[Content: {label}]"
 
-        elif action == "sum":
-            instr = f"{note}\nStudent request: {req or 'Write the cheat sheet now.'}"
-            text = await call_model(parts, instr, SUMMARY_SYS, False, 8000)
-            await send_long(ctx, chat, text)
-            await send_menu(ctx, chat, s)
-
-        elif action == "cards":
-            instr = f"{note}\nStudent request: {req or 'Create the flashcards now.'}"
-            raw = await call_model(parts, instr, CARDS_SYS, True, 8000)
-            cards = load_json(raw).get("cards", [])
-            lines = []
-            for i, c in enumerate(cards, 1):
-                front = html.escape(one_line(c.get("front", "")))
-                back = html.escape(one_line(c.get("back", "")))
-                lines.append(f"{i}) {front}\n<tg-spoiler>{back}</tg-spoiler>")
-            body = "🃏 بطاقات مراجعة (اضغط على الشريط الأسود لتظهر الإجابة)\n\n" + "\n\n".join(lines)
-            for part in chunks(body):
-                await ctx.bot.send_message(chat, part, parse_mode="HTML")
-            await send_menu(ctx, chat, s)
-
-        elif action == "quiz":
-            n = nq or NUM_Q
-            flavor = "NEW and somewhat harder " if harder else ""
-            instr = f"{note}\nWrite exactly {n} {flavor}questions. Student request: {req or 'none'}."
-            old = s.get("qz")
-            if harder and old:
-                prev = "\n".join(q["q"] for q in old["questions"])
-                instr += f"\nDo not repeat these questions:\n{prev}"
-            raw = await call_model(parts, instr, QUESTIONS_SYS, True, 16000)
-            data = load_json(raw)
-            qs = clean_questions(data.get("questions"))
-            if not qs:
-                await ctx.bot.send_message(chat, "ما قدرت أطلع أسئلة من هالمحتوى، جرّب صفحات ثانية.")
+            if action == "sum":
+                instr = f"{note}\nStudent request: {req or 'Write the cheat sheet now.'}"
+                text = await call_model(parts, instr, SUMMARY_SYS, False, 16000, 0.3)
+                await send_long(ctx, chat, text)
                 await send_menu(ctx, chat, s)
-            else:
-                qlang = "ar" if data.get("language") == "ar" else "en"
-                s["qz"] = new_quiz(qlang, qs)
-                s["last"] = {"pages": pages, "nq": nq, "extra": extra}
-                await ctx.bot.send_message(chat, T[qlang]["ready"])
-                await send_question(chat, ctx, s["qz"])
+
+            elif action == "terms":
+                instr = f"{note}\nStudent request: {req or 'Build the full glossary now.'}"
+                text = await call_model(parts, instr, TERMS_SYS, False, 16000, 0.3)
+                await send_long(ctx, chat, text)
+                await send_menu(ctx, chat, s)
+
+            elif action == "exam":
+                instr = f"{note}\nStudent request: {req or 'Write the likely exam questions with full model answers.'}"
+                text = await call_model(parts, instr, EXAM_SYS, False, 32000, 0.4)
+                await send_long(ctx, chat, text)
+                await send_menu(ctx, chat, s)
+
+            elif action == "cards":
+                instr = f"{note}\nStudent request: {req or 'Create the flashcards now.'}"
+                raw = await call_model(parts, instr, CARDS_SYS, True, 8000, 0.5)
+                cards = load_json(raw).get("cards", [])
+                lines = []
+                for i, c in enumerate(cards, 1):
+                    front = html.escape(one_line(c.get("front", "")))
+                    back = html.escape(one_line(c.get("back", "")))
+                    lines.append(f"{i}) {front}\n<tg-spoiler>{back}</tg-spoiler>")
+                body = "🃏 بطاقات مراجعة (اضغط على الشريط الأسود لتظهر الإجابة)\n\n" + "\n\n".join(lines)
+                for part in chunks(body):
+                    await ctx.bot.send_message(chat, part, parse_mode="HTML")
+                await send_menu(ctx, chat, s)
+
+            elif action == "quiz":
+                n = nq or NUM_Q
+                flavor = "NEW and somewhat harder " if harder else ""
+                instr = f"{note}\nWrite exactly {n} {flavor}questions. Student request: {req or 'none'}."
+                old = s.get("qz")
+                if harder and old:
+                    prev = "\n".join(q["q"] for q in old["questions"])
+                    instr += f"\nDo not repeat these questions:\n{prev}"
+                raw = await call_model(parts, instr, QUESTIONS_SYS, True, 16000, 0.7)
+                data = load_json(raw)
+                qs = clean_questions(data.get("questions"))
+                if not qs:
+                    await ctx.bot.send_message(chat, "ما قدرت أطلع أسئلة من هالمحتوى، جرّب صفحات ثانية.")
+                    await send_menu(ctx, chat, s)
+                else:
+                    qlang = "ar" if data.get("language") == "ar" else "en"
+                    s["qz"] = new_quiz(qlang, qs)
+                    s["last"] = {"pages": pages, "nq": nq, "extra": extra}
+                    await ctx.bot.send_message(chat, T[qlang]["ready"])
+                    await send_question(chat, ctx, s["qz"])
     except Exception as e:
         log.exception("action failed")
         await ctx.bot.send_message(chat, fail_text(e))
@@ -824,7 +1062,28 @@ async def run_action(ctx, chat: int, uid: int, action: str, pages=None, nq=None,
 
 # ----------------------------------------------------- storing documents
 
+async def delayed_menu(ctx, chat: int, uid: int, doc: dict):
+    """After an album arrives, wait a moment so every photo is collected, then continue."""
+    await asyncio.sleep(3.5)
+    s = sessions.get(uid)
+    if not s or s.get("doc") is not doc:
+        return
+    cap = s.get("cap")
+    if cap:
+        s["cap"] = None
+        await handle_text(ctx, chat, uid, cap)
+        return
+    await send_menu(ctx, chat, s, text=doc_intro(doc))
+
+
 async def store_document(m, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = m.from_user.id
+    lock = locks.setdefault(uid, asyncio.Lock())
+    async with lock:
+        await _store_document(m, ctx)
+
+
+async def _store_document(m, ctx: ContextTypes.DEFAULT_TYPE):
     uid = m.from_user.id
     s = get_session(uid)
     caption = (m.caption or "").strip()
@@ -833,13 +1092,32 @@ async def store_document(m, ctx: ContextTypes.DEFAULT_TYPE):
     old = s.get("doc")
     doc = None
 
+    img = None
     if m.photo:
         f = await m.photo[-1].get_file()
-        data = bytes(await f.download_as_bytearray())
+        img = {"mid": m.message_id, "data": bytes(await f.download_as_bytearray()), "mime": "image/jpeg"}
+    elif m.document and (m.document.mime_type or "") in IMG_MIMES:
+        if (m.document.file_size or 0) > 19 * 1024 * 1024:
+            await m.reply_text("الصورة كبيرة، ابعتها أصغر من 19MB.")
+            return
+        f = await m.document.get_file()
+        img = {
+            "mid": m.message_id,
+            "data": bytes(await f.download_as_bytearray()),
+            "mime": m.document.mime_type,
+        }
+
+    if img:
         same_group = bool(group and old and old.get("group") == group)
-        recent = bool(old and old["kind"] == "images" and now - old["t"] < 90 and not caption)
+        recent = bool(
+            old and old["kind"] == "images" and not group and not caption and now - old["t"] < 90
+        )
         if old and old["kind"] == "images" and (same_group or recent):
-            old["images"].append(data)
+            if len(old["images"]) >= MAX_IMAGES:
+                await m.reply_text(f"الحد الأقصى {MAX_IMAGES} صورة بالملف الواحد 🙏")
+                return
+            old["images"].append(img)
+            old["images"].sort(key=lambda x: x["mid"])
             old["n"] = len(old["images"])
             old["t"] = now
             if same_group:
@@ -851,7 +1129,7 @@ async def store_document(m, ctx: ContextTypes.DEFAULT_TYPE):
                 text=f"➕ صار عندك {old['n']} صفحات. ابعت كمان أو اختار من الأزرار 👇",
             )
             return
-        doc = {"kind": "images", "name": "صور", "images": [data], "n": 1, "t": now, "group": group}
+        doc = {"kind": "images", "name": "صور", "images": [img], "n": 1, "t": now, "group": group}
 
     elif m.document and m.document.mime_type == "application/pdf":
         if (m.document.file_size or 0) > 19 * 1024 * 1024:
@@ -869,12 +1147,20 @@ async def store_document(m, ctx: ContextTypes.DEFAULT_TYPE):
         await m.reply_text("ابعت صورة أو PDF أو نص.")
         return
 
+    doc["seen"] = now
     s["doc"] = doc
     s["qz"] = None
     s["pending"] = None
     s["last"] = None
     s["cap"] = caption if (group and caption) else None
     history.pop(uid, None)
+
+    # An album: wait for the rest of the photos, then continue once.
+    if group and doc["kind"] == "images":
+        task = asyncio.create_task(delayed_menu(ctx, m.chat_id, uid, doc))
+        bg_tasks.add(task)
+        task.add_done_callback(bg_tasks.discard)
+        return
 
     # A caption on a single file is a request: do it right away.
     if caption and not group:
@@ -888,6 +1174,7 @@ async def on_content(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     m = update.message
     uid = m.from_user.id
     if not allowed(uid):
+        await deny(update)
         return
 
     # In vent mode every text message is a vent. Sending a file leaves vent mode.
@@ -906,7 +1193,7 @@ async def on_content(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await handle_text(ctx, m.chat_id, uid, m.text)
             return
 
-    if uid in busy:
+    if uid in busy and not (m.photo or m.document):
         await m.reply_text("⏳ ...")
         return
     try:
@@ -1008,6 +1295,7 @@ async def on_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     qi = qz["order"][pos]
     q = qz["questions"][qi]
     ok = choice == q["answer"]
+    qz["pos"] = pos + 1  # advance immediately so a double tap cannot count twice
     qz["marks"].append(ok)
     if ok:
         qz["score"] += 1
@@ -1026,7 +1314,6 @@ async def on_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await ctx.bot.send_message(cq.message.chat_id, f"{result}{fire}\n\n{q['why']}"[:4090])
 
-    qz["pos"] += 1
     if qz["pos"] < len(qz["order"]):
         await send_question(cq.message.chat_id, ctx, qz)
         return
@@ -1106,16 +1393,30 @@ async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx, chat, uid, "quiz", last.get("pages"), last.get("nq"), last.get("extra", ""), True
         )
         return
-    if action in ("explain", "solve", "quiz", "sum", "cards"):
+    if action in ("smart", "explain", "solve", "quiz", "sum", "cards", "terms", "exam"):
         await run_action(ctx, chat, uid, action)
 
+
+# ----------------------------------------------------------------- server
 
 async def health(_request):
     return web.Response(text="ok")
 
 
+async def janitor():
+    """Free memory: forget files nobody touched for 2 hours."""
+    while True:
+        await asyncio.sleep(600)
+        cutoff = time.time() - 2 * 3600
+        for uid, s in list(sessions.items()):
+            d = s.get("doc")
+            if d and d.get("seen", d.get("t", 0)) < cutoff and uid not in busy:
+                sessions.pop(uid, None)
+                history.pop(uid, None)
+
+
 async def main():
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("new", new_cmd))
@@ -1130,7 +1431,10 @@ async def main():
     app.add_handler(CallbackQueryHandler(on_retry, pattern=r"^retry$"))
     app.add_handler(
         MessageHandler(
-            (filters.TEXT & ~filters.COMMAND) | filters.PHOTO | filters.Document.PDF,
+            (filters.TEXT & ~filters.COMMAND)
+            | filters.PHOTO
+            | filters.Document.PDF
+            | filters.Document.IMAGE,
             on_content,
         )
     )
@@ -1144,6 +1448,8 @@ async def main():
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=False)
+    task = asyncio.create_task(janitor())
+    bg_tasks.add(task)
     log.info("Bot is running")
     await asyncio.Event().wait()
 
