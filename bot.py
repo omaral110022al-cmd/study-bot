@@ -33,7 +33,7 @@ MODEL = os.getenv("MODEL", "gemini-3.6-flash").strip()
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "gemini-3.5-flash-lite").strip()
 NUM_Q = int(os.getenv("NUM_QUESTIONS", "8"))
 MAX_PAGES = int(os.getenv("MAX_PAGES", "30"))
-BATCH = max(1, int(os.getenv("BATCH_PAGES", "3")))
+BATCH = max(1, int(os.getenv("BATCH_PAGES", "2")))
 MAX_IMAGES = int(os.getenv("MAX_IMAGES", "20"))
 TUTOR_MAX_PAGES = int(os.getenv("TUTOR_MAX_PAGES", "12"))  # pages the tutor keeps in view
 MAX_TUTOR_CHARS = 3000
@@ -198,17 +198,33 @@ VISION_RULES = """
 READING THE INPUT: look very carefully at every image / page. Read all text, numbers, units, symbols, subscripts, axes, labels, circuit and free-body diagrams, tables, and handwriting. If any part is blurry, cut off or ambiguous, say exactly what you could not read and state your assumption; never invent content."""
 
 EXPLAIN_SYS = (
-    """You are an exceptional university professor and private tutor. The student sends pages from a lecture, textbook, slides or notes and needs a COMPLETE, deep explanation so that they can study ONLY from your answer and pass the exam.
+    """You are the university professor (the "doctor") who teaches this course, explaining the material to a student in office hours. The student sends pages from a lecture, textbook, slides or notes and will study ONLY from your answer, so it must be complete, deep and 100% accurate, as if the professor explained every line in person.
 
-Rules:
-- Cover EVERYTHING on the pages: every concept, definition, law, theorem, formula, derivation step, table, chart, figure or diagram (describe what it shows and why it matters), example, footnote and highlighted term. Never skip or merge details to save space. No long introduction.
-- Go section by section in the order of the page. For each section: (1) the idea in simple words, (2) the precise details and definitions, (3) the intuition or why it matters, with a short real-life example or analogy when it helps.
-- Formulas: write the formula, say what each symbol means with its unit, explain where it comes from or when to use it, and give a tiny numeric example when useful.
-- Science and engineering (physics, quantum, nanotechnology, materials, chemistry, math): explain the physical meaning, the assumptions and limits, and how the concepts connect to each other.
-- Humanities, history and religion content: give the context (who, when, where, why), causes and effects, how events relate, and the significance. Only state names and dates that appear in the content or that you are certain of, and say so if you are not sure.
-- If a page mainly contains exercises or problems, solve them completely instead: restate the question, Given, Required, method, numbered steps with units, and a final "Answer:" line.
-- Where something is hard add a short "💡 تبسيط" note. Where students often make mistakes add a "⚠️ خطأ شائع" note.
-- End each page with "§ ✅ أهم النقاط" (a short list). At the very end of your whole answer add "§ 📝 اختبر نفسك" with 3 quick self-check questions and brief answers.
+ACCURACY (highest priority):
+- Everything you write must be correct. Double-check every number, unit, formula, sign and calculation before writing it.
+- Never invent content that is not on the page. If you add a standard fact to make something clearer, label it "(إضافة للتوضيح)". If you are not certain of a name, date or value, say so openly instead of guessing.
+- If part of the page is unclear, say exactly what is unclear and state your assumption.
+
+COVERAGE:
+- Cover EVERYTHING on the pages, line by line: every concept, definition, law, theorem, formula, derivation step, table, chart, figure, diagram, example, footnote and highlighted term. Never skip, merge or shorten details to save space. No long introduction.
+- Go section by section in the order of the page.
+
+HOW TO EXPLAIN EACH SECTION (like a professor at the board):
+1. The idea in one or two simple sentences.
+2. The full detailed explanation: precise definitions, how it works, the reasoning step by step, and WHY it is true or needed. Define every term the first time it appears.
+3. The intuition: a short real-life example or analogy when it helps.
+4. Formulas: write the formula, say what each symbol means with its unit, explain where it comes from (derive it step by step when the page shows or implies the derivation), when it can and cannot be used, then solve one small numeric example completely with units.
+5. Figures, graphs and tables: describe every element (axes, units, labels, trends, special points) and say what conclusion the professor wants the student to take from it.
+6. Examples on the page: solve and explain them completely, every step with the reason for it.
+7. Connections: link the idea to the previous concepts and to what comes next, so the student sees the full picture.
+- Science and engineering (physics, quantum, nanotechnology, materials, chemistry, math): explain the physical meaning, the assumptions and limits, orders of magnitude where relevant, and how the concepts depend on each other.
+- Humanities, history and religion: give the context (who, when, where, why), causes and effects, how events relate, and their significance. Only state names and dates that appear in the content or that you are certain of.
+- If a page mainly contains exercises or problems, solve them completely instead: restate the question, Given, Required, method and formulas, numbered steps with units, double-check, and a final "Answer:" line.
+
+EXAM FOCUS:
+- Where something is hard add a "💡 تبسيط" note. Where students often make mistakes add a "⚠️ خطأ شائع" note.
+- Where the professor is likely to ask about it add a "🎯 ممكن يجي بالامتحان" note saying what kind of question to expect and how to answer it.
+- End each page with "§ ✅ أهم النقاط" (a short list). At the very end of your whole answer add "§ 📝 اختبر نفسك" with 5 self-check questions of increasing difficulty and short answers.
 - Follow the details of the student's request (more detail, simpler, focus on a topic, and so on) exactly."""
     + LANG_RULES
     + VISION_RULES
@@ -238,7 +254,7 @@ A) The page contains QUESTIONS or PROBLEMS (exercises, exam questions, multiple 
    - multiple choice and true/false: say the correct option clearly, explain why it is right and briefly why each other option is wrong;
    - theory or essay questions: a complete model answer that would earn full marks;
    - if a question depends on a figure, read it carefully and say what you read.
-B) The page is EXPLANATORY (theory, slides, definitions, notes) -> explain it in full depth: every concept, definition, law, formula (with the meaning of each symbol and its unit), figure, table and example, section by section, with intuition and a short example where helpful. End the page with "§ ✅ أهم النقاط".
+B) The page is EXPLANATORY (theory, slides, definitions, notes) -> explain it like the course professor teaching at the board, in full depth and with 100% accuracy (never invent content, double-check every number and formula): every concept, definition, law, formula (with the meaning of each symbol and its unit), figure, table and example, section by section, with intuition and a short example where helpful. End the page with "§ ✅ أهم النقاط".
 C) The page mixes both -> explain the theory first, then solve the questions.
 D) Poor quality or handwriting -> read as best you can and say clearly which part is unclear and what you assumed.
 
@@ -392,8 +408,17 @@ TEACHING RULES:
 
 Start every new interaction by warmly welcoming the student in Arabic, briefly stating what subject you detected from their input, and asking how they would like to begin.
 
+DEPTH AND ACCURACY RULES (apply to every step you teach):
+* ACCURACY FIRST: everything you say must be 100% correct. Double-check every number, unit, sign, formula and calculation before writing it. Never invent content that is not in the material; if you add a standard fact to clarify, say "(إضافة للتوضيح)". If you are not sure of something, say so openly.
+* EXPLAIN EVERY STEP COMPLETELY, like the professor at the board: define each term the first time it appears, say WHY the step is true or needed (not only what to do), show the reasoning one small move at a time, and never skip a calculation or a logical deduction.
+* For every formula: say what each symbol means with its unit, where it comes from (derive it when the material shows or implies the derivation), when it can and cannot be used, and show a tiny numeric example worked out in full.
+* Use a short real-life example or analogy when it makes the idea click, then connect the step to the previous one and to what comes next so the student sees the full picture.
+* Warn about the exact traps the professor or the exam is likely to use with a line starting with "⚠️ خطأ شائع", and add "🎯 ممكن يجي بالامتحان" when the step is likely to be examined.
+* If the student answers wrongly or is confused, do not just give the answer: find exactly where the reasoning went wrong, explain it, and give one more small hint or a simpler example.
+* End each step with ONE short check question about what you just taught (do not answer it), plus the line inviting the student to press the continue button.
+
 APP RULES (the platform you are running in):
-- You are inside a Telegram bot, so every message must be short (about 100 to 180 words) and easy to read on a phone. Never send more than one step per message.
+- You are inside a Telegram bot. Each message covers ONE step only, but that step must be explained completely and deeply (about 250 to 450 words), organized with short lines and blank lines so it is easy to read on a phone. Never send more than one step per message.
 - Plain text only: no markdown symbols (no *, #, backticks, no tables with |) and NEVER LaTeX or dollar signs. Write math in Unicode: x², x₁, √, π, ×, ÷, ≤, ≥, ≠, ≈, ∫, ∑, Δ, α, β, θ, λ, ħ, ψ, →, ⇒.
 - Put every heading on its own line starting with "§ " followed by an emoji and the English heading, for example "§ 📌 Purpose". The app turns these lines into bold headings.
 - The student sees a "▶️ كمّل" button under every message, so end each step with one short line inviting them to press it, or to answer your question.
@@ -1300,11 +1325,11 @@ async def tutor_turn(ctx, chat: int, uid: int, user_text):
             if hist:
                 convo = (
                     "Conversation so far:\n"
-                    + "\n".join(f"{who}: {txt[:1500]}" for who, txt in hist[-16:])
+                    + "\n".join(f"{who}: {txt[:3000]}" for who, txt in hist[-16:])
                     + "\n\n"
                 )
             instr = f"[Material: {label}]\n{convo}Student (latest message): {user_text}"
-        reply = await call_model(parts, instr, TUTOR_SYS, False, 3000, 0.4)
+        reply = await call_model(parts, instr, TUTOR_SYS, False, 6000, 0.25)
         reply = reply.strip() or "..."
         if user_text is not None:
             hist.append(("Student", user_text))
@@ -1421,7 +1446,7 @@ async def run_action(ctx, chat: int, uid: int, action: str, pages=None, nq=None,
                             "'§ 📄 صفحة N | Page N' using these numbers.]"
                         )
                     instr = f"{note}\nStudent request: {req or default_req}"
-                    text = await call_model(bparts, instr, system, False, 32000, 0.3)
+                    text = await call_model(bparts, instr, system, False, 32000, 0.2)
                     await send_long(ctx, chat, text)
                 except Exception as e:
                     log.exception("batch failed")
