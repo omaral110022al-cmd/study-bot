@@ -472,7 +472,7 @@ seen: dict[int, dict] = {}
 
 
 known_users: set[int] = set()
-dua_pending: set[int] = set()  # new users who have not been invited yet to make a dua
+dua_done: set[int] = set()  # users who were already invited to make a dua (saved with the users registry)
 dua_wait: set[int] = set()  # users whose next text message is their dua
 DUA_MAX = 1000
 
@@ -531,6 +531,7 @@ async def load_users(bot):
         if pm and pm.text and pm.text.startswith(DB_TAG):
             data = json.loads(pm.text.split("\n", 1)[1])
             known_users.update(int(x) for x in data.get("u", []))
+            dua_done.update(int(x) for x in data.get("d", []))
             db["msg_id"] = pm.message_id
             log.info("loaded %d users", len(known_users))
     except Exception:
@@ -540,11 +541,19 @@ async def load_users(bot):
 async def save_users(bot):
     if not ADMIN_ID:
         return
+
+    def mk(ids, dids):
+        return DB_TAG + "\n" + json.dumps({"u": ids, "d": dids}, separators=(",", ":"))
+
     ids = sorted(known_users)
-    text = DB_TAG + "\n" + json.dumps({"u": ids}, separators=(",", ":"))
-    while len(text) > 3900 and ids:
-        ids = ids[1:]
-        text = DB_TAG + "\n" + json.dumps({"u": ids}, separators=(",", ":"))
+    dids = sorted(dua_done)
+    text = mk(ids, dids)
+    while len(text) > 3900 and (ids or dids):
+        if len(dids) >= len(ids):
+            dids = dids[1:]
+        else:
+            ids = ids[1:]
+        text = mk(ids, dids)
     try:
         if db["msg_id"]:
             try:
@@ -587,9 +596,13 @@ async def track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if u.id not in known_users and allowed(u.id):
         known_users.add(u.id)
-        if u.id != ADMIN_ID:
-            dua_pending.add(u.id)
         schedule_save(ctx.bot)
+    if u.id != ADMIN_ID and allowed(u.id) and u.id not in dua_done:
+        dua_done.add(u.id)
+        schedule_save(ctx.bot)
+        t = asyncio.create_task(_late_invite(ctx.bot, update.effective_chat.id))
+        bg_tasks.add(t)
+        t.add_done_callback(bg_tasks.discard)
     rec = seen.get(u.id)
     if rec:
         rec["count"] += 1
@@ -637,6 +650,32 @@ async def send_dua_invite(ctx, chat: int):
         await ctx.bot.send_message(chat, DUA_INVITE, reply_markup=dua_kb())
     except Exception:
         log.exception("dua invite failed")
+
+
+async def _late_invite(bot, chat: int):
+    await asyncio.sleep(4)  # after the reply to the user's first message
+    try:
+        await bot.send_message(chat, DUA_INVITE, reply_markup=dua_kb())
+    except Exception:
+        log.exception("late dua invite failed")
+
+
+async def duaall_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin only: send the dua invitation right now to every known user who was not invited yet."""
+    if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
+        return
+    targets = [x for x in known_users if allowed(x) and x != ADMIN_ID and x not in dua_done]
+    ok = fail = 0
+    for x in targets:
+        dua_done.add(x)
+        try:
+            await ctx.bot.send_message(x, DUA_INVITE, reply_markup=dua_kb())
+            ok += 1
+        except Exception:
+            fail += 1
+        await asyncio.sleep(0.05)
+    schedule_save(ctx.bot)
+    await update.message.reply_text(f"🤲 تم إرسال الدعوة ✅ {ok}\nفشل (حظروا البوت أو غير موجودين): {fail}")
 
 
 async def dua_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1150,10 +1189,6 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ]
         ),
     )
-    uid0 = update.effective_user.id
-    if uid0 in dua_pending:
-        dua_pending.discard(uid0)
-        await send_dua_invite(ctx, update.effective_chat.id)
 
 
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2021,6 +2056,7 @@ async def main():
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("tutor", tutor_cmd))
     app.add_handler(CommandHandler("dua", dua_cmd))
+    app.add_handler(CommandHandler("duaall", duaall_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(TypeHandler(Update, track), group=-1)
     app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^m:"))
