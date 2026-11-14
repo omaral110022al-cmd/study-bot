@@ -7,6 +7,7 @@ import os
 import random
 import re
 import time
+from collections import Counter
 
 from aiohttp import web
 from google import genai
@@ -28,12 +29,14 @@ log = logging.getLogger("study-bot")
 
 # ------------------------------------------------------------------ config
 TOKEN = os.environ["TELEGRAM_TOKEN"].strip()
-MODEL = os.getenv("MODEL", "gemini-flash-latest").strip()
-FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "gemini-flash-lite-latest").strip()
+MODEL = os.getenv("MODEL", "gemini-3.6-flash").strip()
+FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "gemini-3.5-flash-lite").strip()
 NUM_Q = int(os.getenv("NUM_QUESTIONS", "8"))
 MAX_PAGES = int(os.getenv("MAX_PAGES", "30"))
 BATCH = max(1, int(os.getenv("BATCH_PAGES", "3")))
 MAX_IMAGES = int(os.getenv("MAX_IMAGES", "20"))
+TUTOR_MAX_PAGES = int(os.getenv("TUTOR_MAX_PAGES", "12"))  # pages the tutor keeps in view
+MAX_TUTOR_CHARS = 3000
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "60"))  # requests per user per day, 0 = unlimited
 PORT = int(os.getenv("PORT", "10000"))
 ALLOWED = {int(x) for x in os.getenv("ALLOWED_IDS", "").split(",") if x.strip()}
@@ -47,6 +50,7 @@ busy: set[int] = set()
 locks: dict[int, asyncio.Lock] = {}
 usage: dict[int, list] = {}
 bg_tasks: set = set()
+BOOT = time.time()
 
 LETTERS = {"en": ["A", "B", "C", "D"], "ar": ["أ", "ب", "ج", "د"]}
 IMG_MIMES = {"image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"}
@@ -76,6 +80,7 @@ HELP_TEXT = (
     "• مصطلحات صفحة 7\n"
     "• توقعات امتحان صفحة 1-4\n"
     "• بطاقات مراجعة لصفحة 7\n"
+    "• ادرسني صفحة 5 (أو /tutor): مدرّس خطوة بخطوة 🎓\n"
     "• أو اسألني أي سؤال عن المادة\n\n"
     "4) نصيحة: ابعت الصور «كملف» (بدون ضغط) عشان تطلع أوضح، وصوّر الصفحة كاملة وبإضاءة كويسة.\n"
     "5) رقم الصفحة = ترتيبها داخل الملف، مش رقمها المطبوع.\n"
@@ -299,10 +304,107 @@ VENT_SYS = """You are a warm, caring friend for a university student who needs t
 - Plain text only, no markdown symbols, no lists. A few gentle emojis are fine."""
 
 # action -> (system prompt, default request); these run page-batch by page-batch
+EXTRA_PROMPT = os.getenv("EXTRA_PROMPT", "").strip()
+
+
+def with_extra(system: str) -> str:
+    """Owner's own instructions (set in Render > Environment > EXTRA_PROMPT), added to every explanation and solution."""
+    if not EXTRA_PROMPT:
+        return system
+    return (
+        system
+        + "\n\nEXTRA INSTRUCTIONS FROM THE BOT OWNER (follow them in every answer; they never override the "
+        "accuracy requirement or the output-format rules):\n"
+        + EXTRA_PROMPT
+    )
+
+
+TUTOR_SYS = """UNIVERSAL ACADEMIC TUTOR – STEP-BY-STEP LEARNING SYSTEM
+
+Act as an expert university tutor and exam coach. 
+Whenever the user uploads a file, image, or asks a question, automatically identify the subject matter (e.g., Mathematics, Physics, Programming, Engineering, Theories, etc.) and adapt your explanations to that specific field.
+
+The user is a university student preparing for exams who needs to master topics independently based on their professor's materials.
+
+MOST IMPORTANT RULES:
+1. Teach ONLY ONE topic at a time.
+2. Never explain an entire chapter or send long, overwhelming responses in a single message.
+3. Divide each topic into small, logical learning steps. Explain one step, then explicitly WAIT for the user to reply before moving forward.
+4. Use simple English for headings and academic/technical terminology, but explain the actual material in simple Arabic.
+5. If files or examples are provided, you MUST extract and follow the professor’s exact method, notation, syntax, and order of operations. Do not replace it with your own preferred approach.
+
+PHASE 1 – UNDERSTAND THE TOPIC
+When starting a new topic, explain:
+1. What is this concept/method?
+2. What is its purpose? (Why do we need it?)
+3. When do we use it?
+4. What foundational concept must be understood first?
+Keep explanations simple but academically accurate. Wait for the user to say "Continue" or "كمل".
+
+PHASE 2 – RECOGNIZE THE QUESTION
+Teach the user how to identify this type of problem/question in an exam.
+Show:
+* Its general form, structure, or keywords.
+* How to distinguish it from similar topics.
+* Conditions that must be satisfied before applying the method.
+* Common traps.
+Give short recognition exercises and let the user answer before explaining.
+
+PHASE 3 – LEARN THE METHOD / PROCEDURE
+Analyze the provided examples or standard academic methods.
+* Explain every step in the solution, analysis, or code.
+* Explain WHY each step is necessary.
+* Never skip calculations, logical deductions, or code lines.
+* Highlight important details, constants, signs, or syntax rules.
+* Show the final answer in the standard/preferred academic form.
+Do not move to the next step until the user understands the current one.
+
+PHASE 4 – GUIDED PRACTICE
+Give a question similar to the examples.
+Do NOT solve it immediately. Let the user attempt each step.
+If the user gets stuck:
+* Give ONE small hint.
+* Do not reveal the full solution.
+* Correct mistakes step-by-step and explain the error in reasoning.
+
+PHASE 5 – INDEPENDENT PRACTICE
+Provide 3 levels of questions (Easy, Medium, Exam-level) one by one.
+Do not show solutions before the user attempts them. Correct their work and pinpoint exactly where they went wrong.
+
+PHASE 6 – TOPIC MASTERY SHEET
+At the end of a topic, provide a compact revision summary containing:
+* Recognition rules/keywords.
+* General forms/structures.
+* Exact solution steps.
+* Important formulas/syntax.
+* Common mistakes to avoid.
+* One compact solved example.
+
+PHASE 7 – RETRIEVAL TEST
+Test the user without explanations or hints to see if they can recognize the problem, choose the correct procedure, and solve it independently. If they fail a part, re-teach that specific part.
+
+TEACHING RULES:
+* Arabic for explanations, English for terms/headings.
+* University-level depth.
+* Never assume the user understands a step just because they understood the previous one.
+* NEVER give answers before the user tries.
+* If a user asks a general question, answer it concisely, but if they want to STUDY a topic, strictly follow the 7 phases.
+
+Start every new interaction by warmly welcoming the student in Arabic, briefly stating what subject you detected from their input, and asking how they would like to begin.
+
+APP RULES (the platform you are running in):
+- You are inside a Telegram bot, so every message must be short (about 100 to 180 words) and easy to read on a phone. Never send more than one step per message.
+- Plain text only: no markdown symbols (no *, #, backticks, no tables with |) and NEVER LaTeX or dollar signs. Write math in Unicode: x², x₁, √, π, ×, ÷, ≤, ≥, ≠, ≈, ∫, ∑, Δ, α, β, θ, λ, ħ, ψ, →, ⇒.
+- Put every heading on its own line starting with "§ " followed by an emoji and the English heading, for example "§ 📌 Purpose". The app turns these lines into bold headings.
+- The student sees a "▶️ كمّل" button under every message, so end each step with one short line inviting them to press it, or to answer your question.
+- The study material (pages or images) is attached to every request: always follow the professor's exact method, notation and order of operations from it.
+- When the student's latest message is "كمل" or "Continue", move to the next step of the current phase."""
+
+
 BATCHED = {
-    "smart": (SMART_SYS, "Look at every page. Solve all the questions and explain all the theory, in full detail."),
-    "explain": (EXPLAIN_SYS, "Explain this content comprehensively."),
-    "solve": (REQUEST_SYS, "Solve every question and problem in the content."),
+    "smart": (with_extra(SMART_SYS), "Look at every page. Solve all the questions and explain all the theory, in full detail."),
+    "explain": (with_extra(EXPLAIN_SYS), "Explain this content comprehensively."),
+    "solve": (with_extra(REQUEST_SYS), "Solve every question and problem in the content."),
 }
 
 
@@ -315,6 +417,35 @@ def allowed(uid: int) -> bool:
 _ids = [int(x) for x in os.getenv("ALLOWED_IDS", "").split(",") if x.strip()]
 ADMIN_ID = int(os.getenv("ADMIN_ID") or (_ids[0] if _ids else 0))
 seen: dict[int, dict] = {}
+
+
+known_users: set[int] = set()
+
+# ---- statistics (for /admin) ----
+stats = {
+    "day": "", "req": 0, "actions": Counter(), "fallback": 0,
+    "limited": 0, "errors": 0, "hits": 0, "miss": 0, "users": Counter(),
+}
+
+
+def roll_stats():
+    d = time.strftime("%Y-%m-%d")
+    if stats["day"] != d:
+        stats.update(day=d, req=0, fallback=0, limited=0, errors=0, hits=0, miss=0)
+        stats["actions"] = Counter()
+        stats["users"] = Counter()
+
+
+def bump(name: str, n: int = 1):
+    roll_stats()
+    stats[name] += n
+
+
+def note(uid: int, action: str):
+    roll_stats()
+    stats["req"] += 1
+    stats["actions"][action] += 1
+    stats["users"][uid] += 1
 
 
 def quota_ok(uid: int) -> bool:
@@ -331,6 +462,64 @@ def quota_ok(uid: int) -> bool:
     return True
 
 
+# ---- user registry (kept in a pinned message in the admin's chat so it survives redeploys) ----
+DB_TAG = "#studybot_users"
+db = {"msg_id": None, "task": None}
+
+
+async def load_users(bot):
+    if not ADMIN_ID:
+        return
+    try:
+        chat = await bot.get_chat(ADMIN_ID)
+        pm = getattr(chat, "pinned_message", None)
+        if pm and pm.text and pm.text.startswith(DB_TAG):
+            data = json.loads(pm.text.split("\n", 1)[1])
+            known_users.update(int(x) for x in data.get("u", []))
+            db["msg_id"] = pm.message_id
+            log.info("loaded %d users", len(known_users))
+    except Exception:
+        log.warning("could not load users registry", exc_info=True)
+
+
+async def save_users(bot):
+    if not ADMIN_ID:
+        return
+    ids = sorted(known_users)
+    text = DB_TAG + "\n" + json.dumps({"u": ids}, separators=(",", ":"))
+    while len(text) > 3900 and ids:
+        ids = ids[1:]
+        text = DB_TAG + "\n" + json.dumps({"u": ids}, separators=(",", ":"))
+    try:
+        if db["msg_id"]:
+            try:
+                await bot.edit_message_text(text, chat_id=ADMIN_ID, message_id=db["msg_id"])
+                return
+            except Exception as e:
+                if "not modified" in str(e).lower():
+                    return
+        m = await bot.send_message(ADMIN_ID, text, disable_notification=True)
+        db["msg_id"] = m.message_id
+        await bot.pin_chat_message(ADMIN_ID, m.message_id, disable_notification=True)
+    except Exception:
+        log.warning("could not save users registry", exc_info=True)
+
+
+async def _save_later(bot):
+    await asyncio.sleep(20)
+    await save_users(bot)
+
+
+def schedule_save(bot):
+    t = db.get("task")
+    if t and not t.done():
+        return
+    t = asyncio.create_task(_save_later(bot))
+    db["task"] = t
+    bg_tasks.add(t)
+    t.add_done_callback(bg_tasks.discard)
+
+
 def who(u) -> str:
     name = u.full_name or "?"
     tag = f"@{u.username}" if u.username else "(no username)"
@@ -341,6 +530,9 @@ async def track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if not u or not update.message:
         return
+    if u.id not in known_users and allowed(u.id):
+        known_users.add(u.id)
+        schedule_save(ctx.bot)
     rec = seen.get(u.id)
     if rec:
         rec["count"] += 1
@@ -373,6 +565,76 @@ async def users_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     lines = [f"{i}) {r['info']} — {r['count']} msgs" for i, r in enumerate(seen.values(), 1)]
     await update.message.reply_text("\n".join(lines)[:4000])
+
+
+def _fmt_uptime(sec: float) -> str:
+    h, rem = divmod(int(sec), 3600)
+    return f"{h // 24}d {h % 24}h {rem // 60}m" if h >= 24 else f"{h}h {rem // 60}m"
+
+
+async def admin_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
+        return
+    roll_stats()
+    acts = "، ".join(f"{k} {v}" for k, v in stats["actions"].most_common()) or "-"
+    top = []
+    for i, (uid, c) in enumerate(stats["users"].most_common(5), 1):
+        info = seen.get(uid, {}).get("info", f"id: {uid}")
+        top.append(f"{i}) {info} — {c}")
+    text = (
+        f"📊 لوحة الإدارة ({stats['day']})\n\n"
+        f"🔹 طلبات اليوم: {stats['req']}\n"
+        f"🔹 حسب النوع: {acts}\n"
+        f"🔁 تحويل للموديل الاحتياطي: {stats['fallback']}\n"
+        f"🚦 وصول لحد جيمناي (429): {stats['limited']}\n"
+        f"⚠️ أخطاء: {stats['errors']}\n\n"
+        f"👥 مستخدمين مسجّلين: {len(known_users)} | بهالجلسة: {len(seen)} | جلسات ملفات فعالة: {len(sessions)}\n"
+        f"🕒 شغّال من: {_fmt_uptime(time.time() - BOOT)}\n"
+        f"🤖 الموديل: {MODEL} (احتياطي: {FALLBACK_MODEL})\n"
+        f"📈 حد يومي لكل شخص: {DAILY_LIMIT or 'بدون'}\n\n"
+        f"🏆 أكثر المستخدمين اليوم:\n" + ("\n".join(top) if top else "-")
+    )
+    await update.message.reply_text(text[:4000])
+
+
+async def broadcast_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
+        return
+    parts = (update.message.text or "").split(None, 1)
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_text("اكتب الرسالة بعد الأمر، مثلاً:\n/broadcast تم تحديث البوت 🎉")
+        return
+    targets = [u for u in known_users if allowed(u) and u != ADMIN_ID]
+    ctx.application.bot_data["bcast"] = {"text": parts[1].strip(), "targets": targets}
+    kb = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton(f"✅ أرسل لـ {len(targets)}", callback_data="b:ok"),
+            InlineKeyboardButton("❌ إلغاء", callback_data="b:no"),
+        ]]
+    )
+    await update.message.reply_text(f"📢 معاينة الرسالة:\n\n{parts[1].strip()}", reply_markup=kb)
+
+
+async def on_bcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cq = update.callback_query
+    await cq.answer()
+    if not ADMIN_ID or cq.from_user.id != ADMIN_ID:
+        return
+    pend = ctx.application.bot_data.pop("bcast", None)
+    if cq.data.endswith("no") or not pend:
+        await cq.edit_message_reply_markup(None)
+        await ctx.bot.send_message(ADMIN_ID, "تم الإلغاء.")
+        return
+    await cq.edit_message_reply_markup(None)
+    ok = fail = 0
+    for uid in pend["targets"]:
+        try:
+            await ctx.bot.send_message(uid, "📢 " + pend["text"])
+            ok += 1
+        except Exception:
+            fail += 1
+        await asyncio.sleep(0.05)
+    await ctx.bot.send_message(ADMIN_ID, f"تم الإرسال ✅ {ok}\nفشل (حظروا البوت أو غير موجودين): {fail}")
 
 
 def load_json(text: str) -> dict:
@@ -427,12 +689,14 @@ def fmt_html(text: str) -> str:
     return "\n".join(out)
 
 
-async def send_long(ctx, chat: int, text: str):
-    for part in chunks((text or "").strip() or "...", 3500):
+async def send_long(ctx, chat: int, text: str, markup=None):
+    parts = chunks((text or "").strip() or "...", 3500)
+    for i, part in enumerate(parts):
+        kb = markup if (markup is not None and i == len(parts) - 1) else None
         try:
-            await ctx.bot.send_message(chat, fmt_html(part), parse_mode="HTML")
+            await ctx.bot.send_message(chat, fmt_html(part), parse_mode="HTML", reply_markup=kb)
         except Exception:
-            await ctx.bot.send_message(chat, part.replace("§ ", ""))
+            await ctx.bot.send_message(chat, part.replace("§ ", ""), reply_markup=kb)
 
 
 async def call_model(parts, instruction, system, as_json=True, max_tokens=16000, temperature=0.4) -> str:
@@ -454,6 +718,8 @@ async def call_model(parts, instruction, system, as_json=True, max_tokens=16000,
                         model=mdl, contents=contents, config=cfg
                     )
                     if resp.text:
+                        if mdl != MODEL:
+                            bump("fallback")
                         return resp.text
                     last = RuntimeError("empty response")
                     break
@@ -462,6 +728,7 @@ async def call_model(parts, instruction, system, as_json=True, max_tokens=16000,
                     msg = str(e)
                     if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
                         limited = True
+                        bump("limited")
                         break  # try the next model
                     await asyncio.sleep(2 * (attempt + 1))
         if not limited:
@@ -473,7 +740,10 @@ async def call_model(parts, instruction, system, as_json=True, max_tokens=16000,
 
 def fail_text(e: Exception) -> str:
     msg = str(e)
-    return LIMIT_MSG if ("429" in msg or "RESOURCE_EXHAUSTED" in msg) else ERR_MSG
+    if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+        return LIMIT_MSG
+    bump("errors")
+    return ERR_MSG
 
 
 # ------------------------------------------------- understanding requests
@@ -497,6 +767,7 @@ INTENTS = {
     "smart": ["حلل", "حللي", "حللها", "تحليل", "ذكي", "analyze", "analyse", "smart"],
     "terms": ["مصطلحات", "مفردات", "glossary", "terms", "vocabulary"],
     "exam": ["امتحان", "امتحانات", "توقعات", "exam", "exams"],
+    "tutor": ["ادرسني", "درسني", "علمني", "tutor", "teach"],
 }
 WORD2INTENT = {w: k for k, ws in INTENTS.items() for w in ws}
 
@@ -703,6 +974,7 @@ def menu_kb(s=None, after_quiz: bool = False) -> InlineKeyboardMarkup:
 
     rows = [
         [b("🧠 تحليل ذكي (حل + شرح تلقائي)", "smart")],
+        [b("🎓 مدرّس خطوة بخطوة", "tutor")],
         [b("📖 اشرح", "explain"), b("✅ حل الأسئلة", "solve")],
         [b("📝 أسئلة اختبار", "quiz"), b("📋 ملخص", "sum")],
         [b("🃏 بطاقات", "cards"), b("🔤 مصطلحات", "terms")],
@@ -778,6 +1050,9 @@ async def new_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # --------------------------------------------------------------- vent
 
 async def enter_vent(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, uid: int):
+    _s = sessions.get(uid)
+    if _s:
+        _s["tutor"] = None
     venting.add(uid)
     vent_hist.pop(uid, None)
     kb = InlineKeyboardMarkup(
@@ -804,6 +1079,10 @@ async def vent_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def stop_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not allowed(uid):
+        return
+    s = sessions.get(uid)
+    if s and s.get("tutor"):
+        await exit_tutor(ctx, update.effective_chat.id, uid)
         return
     await exit_vent(update.effective_chat.id, ctx, uid)
 
@@ -849,6 +1128,7 @@ async def answer_question(ctx, chat: int, uid: int, text: str, pages):
     if not quota_ok(uid):
         await ctx.bot.send_message(chat, QUOTA_MSG)
         return
+    note(uid, "ask")
     busy.add(uid)
     try:
         await ctx.bot.send_chat_action(chat, "typing")
@@ -911,10 +1191,173 @@ async def handle_text(ctx, chat: int, uid: int, text: str):
             return
 
     intent = detect_intent(text)
-    if intent:
+    if intent == "tutor":
+        await start_tutor(ctx, chat, uid, pages)
+    elif intent:
         await run_action(ctx, chat, uid, intent, pages, extract_count(text), text)
     else:
         await answer_question(ctx, chat, uid, text, pages)
+
+
+# ------------------------------------------------------------ tutor mode
+
+def tutor_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("▶️ كمّل", callback_data="t:next"),
+            InlineKeyboardButton("🚪 خروج", callback_data="t:exit"),
+        ]]
+    )
+
+
+def tutor_pages_error(doc, pages):
+    if not pages:
+        return "اكتب أرقام الصفحات، مثلاً: 5-8"
+    n = (doc or {}).get("n") or 0
+    bad = [p for p in pages if n and p > n]
+    if bad:
+        return f"الملف فيه {n} صفحة بس، وما في صفحة {bad[0]} 🤔"
+    if len(pages) > TUTOR_MAX_PAGES:
+        return f"حدد {TUTOR_MAX_PAGES} صفحة على الأكثر 🙏"
+    return None
+
+
+async def start_tutor(ctx, chat: int, uid: int, pages=None):
+    s = get_session(uid)
+    venting.discard(uid)
+    vent_hist.pop(uid, None)
+    t = {"pages": None, "hist": [], "await": False}
+    s["tutor"] = t
+    doc = s.get("doc")
+    if doc and doc["kind"] != "text":
+        n = doc["n"]
+        if pages:
+            err = tutor_pages_error(doc, pages)
+            if err:
+                t["await"] = True
+                await ctx.bot.send_message(chat, "🎓 وضع المدرّس شغّال.\n" + err)
+                return
+            t["pages"] = pages
+        elif n and n > TUTOR_MAX_PAGES:
+            t["await"] = True
+            await ctx.bot.send_message(
+                chat,
+                f"🎓 وضع المدرّس شغّال.\nالملف فيه {n} صفحة. اكتب الصفحات اللي بدك تدرسها "
+                f"(مثلاً 5-8، بحد أقصى {TUTOR_MAX_PAGES} صفحة).",
+            )
+            return
+    await tutor_turn(ctx, chat, uid, None)
+
+
+async def tutor_text(ctx, chat: int, uid: int, text: str):
+    s = sessions.get(uid)
+    t = s.get("tutor") if s else None
+    if not t:
+        return
+    if t.get("await"):
+        doc = s.get("doc")
+        pg = extract_pages(text, bare=True)
+        err = tutor_pages_error(doc, pg)
+        if err:
+            await ctx.bot.send_message(chat, err)
+            return
+        t["pages"] = pg
+        t["await"] = False
+        await tutor_turn(ctx, chat, uid, None)
+        return
+    await tutor_turn(ctx, chat, uid, text)
+
+
+async def tutor_turn(ctx, chat: int, uid: int, user_text):
+    s = sessions.get(uid)
+    t = s.get("tutor") if s else None
+    if not t:
+        return
+    if uid in busy:
+        await ctx.bot.send_message(chat, "⏳ ...")
+        return
+    if not quota_ok(uid):
+        await ctx.bot.send_message(chat, QUOTA_MSG)
+        return
+    note(uid, "tutor")
+    busy.add(uid)
+    try:
+        await ctx.bot.send_chat_action(chat, "typing")
+        doc = s.get("doc")
+        parts, label = [], "no file attached"
+        if doc:
+            doc["seen"] = time.time()
+            parts, label = await build_parts(doc, t["pages"])
+        hist = t["hist"]
+        if user_text is None:
+            instr = (
+                f"[Material: {label}]\n[NEW INTERACTION] The student has just opened tutor mode. "
+                "Start exactly as the rules say: welcome the student warmly in Arabic, state the subject you "
+                "detected from the material, and ask how they would like to begin. Do not teach yet."
+            )
+        else:
+            convo = ""
+            if hist:
+                convo = (
+                    "Conversation so far:\n"
+                    + "\n".join(f"{who}: {txt[:1500]}" for who, txt in hist[-16:])
+                    + "\n\n"
+                )
+            instr = f"[Material: {label}]\n{convo}Student (latest message): {user_text}"
+        reply = await call_model(parts, instr, TUTOR_SYS, False, 3000, 0.4)
+        reply = reply.strip() or "..."
+        if user_text is not None:
+            hist.append(("Student", user_text))
+        hist.append(("Tutor", reply))
+        t["hist"] = hist[-30:]
+        await send_long(ctx, chat, reply, markup=tutor_kb())
+    except DocError as e:
+        await ctx.bot.send_message(chat, str(e))
+    except Exception as e:
+        log.exception("tutor failed")
+        await ctx.bot.send_message(chat, fail_text(e))
+    finally:
+        busy.discard(uid)
+
+
+async def exit_tutor(ctx, chat: int, uid: int):
+    s = sessions.get(uid)
+    if s and s.get("tutor"):
+        s["tutor"] = None
+        await ctx.bot.send_message(chat, "تمام 🎓 طلعنا من وضع المدرّس. وقت ما بدك نكمّل ابعت /tutor.")
+        if s.get("doc"):
+            await send_menu(ctx, chat, s)
+
+
+async def tutor_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not allowed(uid):
+        await deny(update)
+        return
+    pages = extract_pages(" ".join(ctx.args or []), bare=True) if ctx.args else None
+    await start_tutor(ctx, update.effective_chat.id, uid, pages)
+
+
+async def on_tutor_btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cq = update.callback_query
+    await cq.answer()
+    uid = cq.from_user.id
+    if not allowed(uid):
+        return
+    chat = cq.message.chat_id
+    s = sessions.get(uid)
+    if not s or not s.get("tutor"):
+        await ctx.bot.send_message(chat, "وضع المدرّس مطفي. اضغط 🎓 من القائمة أو ابعت /tutor")
+        return
+    act = cq.data.split(":")[1]
+    try:
+        await cq.edit_message_reply_markup(None)  # one live button row at a time
+    except Exception:
+        pass
+    if act == "exit":
+        await exit_tutor(ctx, chat, uid)
+        return
+    await tutor_text(ctx, chat, uid, "كمل")
 
 
 # ------------------------------------------------------------- actions
@@ -930,6 +1373,7 @@ async def run_action(ctx, chat: int, uid: int, action: str, pages=None, nq=None,
     if not quota_ok(uid):
         await ctx.bot.send_message(chat, QUOTA_MSG)
         return
+    note(uid, action)
     doc = s["doc"]
     doc["seen"] = time.time()
     busy.add(uid)
@@ -1152,6 +1596,7 @@ async def _store_document(m, ctx: ContextTypes.DEFAULT_TYPE):
     s["qz"] = None
     s["pending"] = None
     s["last"] = None
+    s["tutor"] = None
     s["cap"] = caption if (group and caption) else None
     history.pop(uid, None)
 
@@ -1184,6 +1629,15 @@ async def on_content(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         venting.discard(uid)
         vent_hist.pop(uid, None)
+
+    # Tutor mode: every text message is the student's reply. A new file ends it.
+    s0 = sessions.get(uid)
+    if s0 and s0.get("tutor"):
+        if m.text and len(m.text) <= MAX_TUTOR_CHARS:
+            await tutor_text(ctx, m.chat_id, uid, m.text)
+            return
+        if not m.text:
+            s0["tutor"] = None
 
     # Short text = a request or question. Long text = pasted study material.
     if m.text:
@@ -1369,6 +1823,9 @@ async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if action == "help":
         await ctx.bot.send_message(chat, HELP_TEXT)
         return
+    if action == "tutor":
+        await start_tutor(ctx, chat, uid, None)
+        return
 
     s = sessions.get(uid)
     if not s or not s.get("doc"):
@@ -1424,11 +1881,16 @@ async def main():
     app.add_handler(CommandHandler("vent", vent_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("users", users_cmd))
+    app.add_handler(CommandHandler("admin", admin_cmd))
+    app.add_handler(CommandHandler("tutor", tutor_cmd))
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(TypeHandler(Update, track), group=-1)
     app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^m:"))
     app.add_handler(CallbackQueryHandler(on_answer, pattern=r"^a:"))
     app.add_handler(CallbackQueryHandler(on_hint, pattern=r"^h:"))
     app.add_handler(CallbackQueryHandler(on_retry, pattern=r"^retry$"))
+    app.add_handler(CallbackQueryHandler(on_bcast, pattern=r"^b:"))
+    app.add_handler(CallbackQueryHandler(on_tutor_btn, pattern=r"^t:"))
     app.add_handler(
         MessageHandler(
             (filters.TEXT & ~filters.COMMAND)
@@ -1447,6 +1909,7 @@ async def main():
 
     await app.initialize()
     await app.start()
+    await load_users(app.bot)
     await app.updater.start_polling(drop_pending_updates=False)
     task = asyncio.create_task(janitor())
     bg_tasks.add(task)
