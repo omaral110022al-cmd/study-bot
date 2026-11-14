@@ -198,6 +198,13 @@ VISION_RULES = """
 
 READING THE INPUT: look very carefully at every image / page. Read all text, numbers, units, symbols, subscripts, axes, labels, circuit and free-body diagrams, tables, and handwriting. If any part is blurry, cut off or ambiguous, say exactly what you could not read and state your assumption; never invent content."""
 
+EXACT_RULES = """
+
+FOLLOW THE REQUEST EXACTLY:
+- If the student's request names something specific (a page, a question number, a topic, a part, a format, a length, a language), do exactly that and nothing else: no other pages or topics, no extra sections, no extra "key points", exam notes, self-test questions or summaries that were not asked for, and nothing left out of what was asked.
+- The full structure described above (every section, key points, self-test, exam notes) is for a general request such as "explain this" with no specific limit.
+- Never wander into other subjects. Stay on the material and on the request."""
+
 EXPLAIN_SYS = (
     """You are the university professor (the "doctor") who teaches this course, explaining the material to a student in office hours. The student sends pages from a lecture, textbook, slides or notes and will study ONLY from your answer, so it must be complete, deep and 100% accurate, as if the professor explained every line in person.
 
@@ -229,6 +236,7 @@ EXAM FOCUS:
 - Follow the details of the student's request (more detail, simpler, focus on a topic, and so on) exactly."""
     + LANG_RULES
     + VISION_RULES
+    + EXACT_RULES
     + FORMAT_RULES
 )
 
@@ -243,6 +251,7 @@ When the task is to solve:
 - If a question depends on a figure, read the figure carefully and say what you read from it.
 - Language: Arabic question gets an Arabic solution. English question gets the full solution explained in Arabic first (steps, reasoning and the final answer, keeping technical terms in English), then directly under it the same full solution in English under a line that starts with "🇬🇧 English". If the student's request is written in Arabic, make the explanations Arabic and keep technical terms in English."""
     + VISION_RULES
+    + EXACT_RULES
     + FORMAT_RULES
 )
 
@@ -262,6 +271,7 @@ D) Poor quality or handwriting -> read as best you can and say clearly which par
 For several pages, handle each page separately under its own heading. Never skip details. Be accurate: double-check every number and fact. Where something is hard add a "💡 تبسيط" note, and where students often err add a "⚠️ خطأ شائع" note.
 Language: Arabic pages get Arabic only. English pages get the full Arabic explanation or solution first (steps, reasoning and final answer, technical terms kept in English), then directly under each Arabic part the same full explanation or solution in English under a line that starts with "🇬🇧 English"."""
     + VISION_RULES
+    + EXACT_RULES
     + FORMAT_RULES
 )
 
@@ -304,13 +314,23 @@ CARDS_SYS = """Create 10 flashcards from the given content for active recall. Re
 {"cards": [{"front": "...", "back": "..."}]}
 Each front and back is ONE short line of plain text (no line breaks, no markdown, no LaTeX; use Unicode math). For math content: front = a problem type or formula question, back = the method or formula. Language: Arabic content gets Arabic cards; otherwise English cards."""
 
-ASK_SYS = """You are a friendly, knowledgeable tutor and assistant. The student asks you a question.
-- If file content is provided, use it as context when the question relates to it. If the question is not about the content, answer from your general knowledge.
-- If there is a previous conversation, use it to understand follow-up questions.
-- Reply in the same language as the student's question (Arabic question: Arabic answer; English question: English answer).
+ASK_SYS = """You are the student's friendly, smart study partner and tutor. You are CHATTING with them, like a knowledgeable friend sitting next to them, not writing a report.
+
+HOW TO TALK:
+- Talk naturally and warmly, in the same language and style the student uses. If they write Arabic in a casual dialect, answer in simple, friendly Arabic close to their style (not stiff formal Arabic). If they write English, answer in English. Technical terms stay in English.
+- Start with the answer itself. No long introductions, no repeating the question, no filler.
+- Use the previous conversation to understand follow-ups ("and this one?", "why?", "give me an example") and answer them as part of the same chat.
+
+WHAT TO ANSWER (very important):
+- If the student asks a QUESTION (about the file, a page, a piece of text, or anything else): answer exactly that question, completely and correctly. When the question is about the file or a page, answer from it and follow what it actually says. If it is not about the file, answer from your general knowledge.
+- If the student asks you to DO something (translate, rewrite, shorten, explain a part, solve a question, compare, give an example, and so on): do exactly what they asked, with nothing added and nothing left out. Respect any limit they give (number of lines, a specific page, a specific part, a specific language).
+- Do NOT add things they did not ask for: no extra tips, no summaries, no extra examples, no "you may also want to know", no follow-up questions, no related topics, no lectures. Do not change the subject or jump to other topics. After you finish, stop. Only ask a short question back if you truly cannot answer without it.
+- Match the length to the question: a simple question gets a short direct answer, a complex one gets a complete, step-by-step answer.
+
+QUALITY:
+- Be accurate. Double-check numbers, units, formulas and facts. If the file is unclear or you are not sure, say so honestly instead of guessing. Never invent content that is not in the file.
 - For math, physics, or any calculation: show clear step-by-step work, double-check the arithmetic, and state the final answer.
-- Be clear, accurate, and complete but not wordy. If you are not sure about something, say so honestly instead of guessing.
-- Plain text only: no markdown symbols (no *, #, or backticks) and NEVER LaTeX or dollar signs. Write math in Unicode: x², √, π, ×, ÷, ≤, ≥. Use numbering, line breaks, and a few emojis when helpful."""
+- Plain text only: no markdown symbols (no *, #, or backticks) and NEVER LaTeX or dollar signs. Write math in Unicode: x², √, π, ×, ÷, ≤, ≥. Use numbering and line breaks to keep it easy to read on a phone. Emojis only rarely."""
 
 VENT_SYS = """You are a warm, caring friend for a university student who needs to vent. Speak natural, friendly Jordanian-flavored Arabic by default (reply in the student's language if they write in another one).
 - Listen first. Reflect and validate what they feel in your own words. Keep replies short: 2 to 5 sentences. Ask at most one gentle question, and only if it helps them keep talking.
@@ -409,6 +429,12 @@ TEACHING RULES:
 
 Start every new interaction by warmly welcoming the student in Arabic, briefly stating what subject you detected from their input, and asking how they would like to begin.
 
+CONVERSATION RULES (the student is talking with you like with a real tutor):
+* Talk naturally and warmly, like a person in a conversation, in the student's own style (simple friendly Arabic, not stiff formal Arabic).
+* If the student asks a question (about the material or anything else), answer exactly that question first, directly, without forcing the study phases.
+* If the student asks you to do something (explain a part, give an example, check their answer, repeat, simplify), do exactly that, with nothing added and nothing left out.
+* Never jump to other topics or add things the student did not ask for. Only when the student wants to study a topic do you follow the phases.
+
 DEPTH AND ACCURACY RULES (apply to every step you teach):
 * ACCURACY FIRST: everything you say must be 100% correct. Double-check every number, unit, sign, formula and calculation before writing it. Never invent content that is not in the material; if you add a standard fact to clarify, say "(إضافة للتوضيح)". If you are not sure of something, say so openly.
 * EXPLAIN EVERY STEP COMPLETELY, like the professor at the board: define each term the first time it appears, say WHY the step is true or needed (not only what to do), show the reasoning one small move at a time, and never skip a calculation or a logical deduction.
@@ -446,6 +472,9 @@ seen: dict[int, dict] = {}
 
 
 known_users: set[int] = set()
+dua_pending: set[int] = set()  # new users who have not been invited yet to make a dua
+dua_wait: set[int] = set()  # users whose next text message is their dua
+DUA_MAX = 1000
 
 # ---- statistics (for /admin) ----
 stats = {
@@ -558,6 +587,8 @@ async def track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if u.id not in known_users and allowed(u.id):
         known_users.add(u.id)
+        if u.id != ADMIN_ID:
+            dua_pending.add(u.id)
         schedule_save(ctx.bot)
     rec = seen.get(u.id)
     if rec:
@@ -581,6 +612,77 @@ async def deny(update: Update):
         )
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------- dua for the owner
+DUA_INVITE = (
+    "🤲 قبل ما نبلّش...\n\n"
+    "إذا بتحب، ادعي لصاحب البوت دعوة من قلبك، بتوصله مباشرة وبتفرّحه 🤍\n"
+    "(الدعوة بتوصل لصاحب البوت مع اسمك)\n\n"
+    "ما في إجبار، وبتقدر تتخطّى."
+)
+
+
+def dua_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("🤲 أدعيله", callback_data="d:yes"),
+            InlineKeyboardButton("تخطّي", callback_data="d:skip"),
+        ]]
+    )
+
+
+async def send_dua_invite(ctx, chat: int):
+    try:
+        await ctx.bot.send_message(chat, DUA_INVITE, reply_markup=dua_kb())
+    except Exception:
+        log.exception("dua invite failed")
+
+
+async def dua_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update.effective_user.id):
+        return
+    await send_dua_invite(ctx, update.effective_chat.id)
+
+
+async def on_dua_btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cq = update.callback_query
+    uid = cq.from_user.id
+    if not allowed(uid):
+        await cq.answer()
+        return
+    await cq.answer()
+    chat = cq.message.chat_id
+    try:
+        await cq.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    if cq.data == "d:yes":
+        dua_wait.add(uid)
+        await ctx.bot.send_message(chat, "اكتب دعوتك هون 🤍")
+    else:
+        dua_wait.discard(uid)
+        await ctx.bot.send_message(chat, "تمام 🌷 وقت ما بدك اكتب /dua. يلا نبلّش، ابعتلي الملف أو سؤالك.")
+
+
+async def take_dua(m, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    """The user's next text message is a dua for the owner. Returns True if it was handled."""
+    uid = m.from_user.id
+    if not (m.text and len(m.text) <= DUA_MAX):
+        dua_wait.discard(uid)  # a file or a long text: leave dua mode and carry on normally
+        return False
+    dua_wait.discard(uid)
+    if not ADMIN_ID:
+        await m.reply_text("جزاك الله خير 🤍")
+        return True
+    try:
+        await ctx.bot.send_message(ADMIN_ID, f"🤲 دعوة إلك من:\n{who(m.from_user)}\n\n{m.text}")
+        await m.reply_text("جزاك الله خير، وصلت دعوتك 🤍 ولك بمثلها إن شاء الله.\n\nيلا نبلّش، ابعتلي الملف أو سؤالك 📚")
+    except Exception:
+        log.exception("dua forward failed")
+        await m.reply_text("صار خطأ وما وصلت دعوتك، بس الله بيسمعها 🤍")
+    return True
+
 
 
 async def users_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1048,6 +1150,10 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ]
         ),
     )
+    uid0 = update.effective_user.id
+    if uid0 in dua_pending:
+        dua_pending.discard(uid0)
+        await send_dua_invite(ctx, update.effective_chat.id)
 
 
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1175,16 +1281,16 @@ async def answer_question(ctx, chat: int, uid: int, text: str, pages):
         if hist:
             convo = (
                 "Previous conversation:\n"
-                + "\n".join(f"Student: {q}\nTutor: {a[:800]}" for q, a in hist[-4:])
+                + "\n".join(f"Student: {q}\nTutor: {a[:1500]}" for q, a in hist[-8:])
                 + "\n\n"
             )
         ctxnote = f"[File context: {label}]\n" if parts else ""
         answer = await call_model(
-            parts, f"{ctxnote}{convo}Student question: {text}", ASK_SYS, False, 8000, 0.4
+            parts, f"{ctxnote}{convo}Student question: {text}", ASK_SYS, False, 8000, 0.3
         )
         answer = answer.strip() or "..."
         hist.append((text, answer))
-        history[uid] = hist[-6:]
+        history[uid] = hist[-10:]
         await send_long(ctx, chat, answer + note)
     except Exception as e:
         log.exception("ask failed")
@@ -1648,6 +1754,11 @@ async def on_content(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await deny(update)
         return
 
+    # The user chose to make a dua for the owner: their next text message is the dua.
+    if uid in dua_wait:
+        if await take_dua(m, ctx):
+            return
+
     # In vent mode every text message is a vent. Sending a file leaves vent mode.
     if uid in venting:
         if m.text:
@@ -1909,9 +2020,11 @@ async def main():
     app.add_handler(CommandHandler("users", users_cmd))
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("tutor", tutor_cmd))
+    app.add_handler(CommandHandler("dua", dua_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(TypeHandler(Update, track), group=-1)
     app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^m:"))
+    app.add_handler(CallbackQueryHandler(on_dua_btn, pattern=r"^d:"))
     app.add_handler(CallbackQueryHandler(on_answer, pattern=r"^a:"))
     app.add_handler(CallbackQueryHandler(on_hint, pattern=r"^h:"))
     app.add_handler(CallbackQueryHandler(on_retry, pattern=r"^retry$"))
